@@ -1,4 +1,6 @@
 # Estimating growth curve parameters via MCMC in JAGS
 
-* Treating parameters as covarying, and estimating parameters and their variance: `covar_param.Rmd`
+* Treating parameters as independent, and estimating parameters and their variance: `iid_param.Rmd`
+* Treating parameters as covarying, and estimating parameters and their variance/covariance: `covar_param.Rmd` 
+  * refer `e_outliers.Rmd` for removal of outlier genotypes to improve estimates for e
 * Treating paramaters as independent, using Cholesky factorisation to incorporate genotype relationship matrix (GRM) and estimating parameters: `GRM_iidparam.Rmd`
