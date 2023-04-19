@@ -1,0 +1,314 @@
+---
+title: "Independent Parameters"
+author: "Meera"
+date: "2023-04-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import R Libraries
+```{r import}
+library(rjags)
+library(ggplot2)
+library(MASS)
+```
+
+## Simulating Growth Curves
+
+### Setting up variables
+```{r variables}
+ngeno = 100 # number of genotypes
+nrep = 3 # number of replicates
+# for reproducibility
+seed = 13
+set.seed(seed)
+genotype = 1:ngeno
+replicate = 1:nrep
+```
+
+### Simulating growth curves
+$$
+[b_i, d_i, e_i] \sim MVN(\ [-0.5,0.5,20]\ , \ \Sigma) \\
+\Sigma = \text{inverse Wishart } \bigg( S =  \begin{bmatrix}
+    100 & & \\
+    & 10 & \\
+    & & 10
+  \end{bmatrix}, \text{df} = 4 \bigg) \\
+  y_{i,j} \sim MVN \bigg(\frac{d_i}{1 + exp(b_i(T - e_i))},  \begin{bmatrix}
+    0.001 & & \\
+    & \ddots & \\
+    & & 0.001
+  \end{bmatrix}\bigg)
+$$
+
+```{r simulation}
+R = diag(c(100,10,10)) # scaled matrix for Wishart dist
+df = 4 # degrees of freedom for Wishart dist
+set.seed(seed)
+sigma = solve(rWishart(n = 1, df = df, Sigma = R)[,,1])
+
+set.seed(seed)
+mvmean = c(-0.5,0.5,20) # means for b,d,e parameters
+params = mvrnorm(ngeno, mvmean, sigma)
+
+paramnames = c("b", "d", "e")
+colnames(params) = paramnames
+data = as.data.frame(cbind(genotype, params))
+
+alldata = c()
+time = seq(0, 40, 5)
+
+var_y = 0.001
+sigma_y = diag(var_y, length(time))
+for (i in 1:ngeno) {
+  subdata = data[data$genotype == i,] # pick the genotype-specific b,d,e
+  mu_arr = (subdata$d)/(1 + exp(subdata$b*(time-subdata$e))) # growth curve as mean
+  set.seed(seed)
+  y = mvrnorm(nrep, mu_arr, sigma_y) # n replicates
+  for (j in 1:nrep) {
+    alldata = rbind(alldata, cbind(rep(i, length(time)), rep(j, length(time)),time, y[j,]))
+  }
+}
+
+alldata = as.data.frame(alldata)
+colnames(alldata) = c("genotype", "rep", "time", "y")
+alldata$rep = as.character(alldata$rep)
+
+#  removing outlier genotype, identified in e_outliers.R
+bad_geno = c(50) 
+alldata = alldata[!(alldata$genotype %in% bad_geno),]
+dim(alldata)
+genotype = genotype[!(genotype %in% bad_geno)]
+ngeno = length(genotype)
+
+head(alldata)
+```
+
+### Summary of simulated growth curves
+```{r summary}
+print("covariance matrix (sigma) for growth curve parameters = ")
+sigma
+paramnames = c("b", "d", "e")
+for (i in 1:3){
+  print(paste("realized variance for",paramnames[i], ":", var(params[,i])))
+}
+```
+
+### Visualise some growth curves
+```{r plot growth curve}
+set.seed(seed)
+plot = ggplot() + geom_point(data = alldata[alldata$genotype %in% sample(genotype, 10),], aes(x = time, y = y, color = rep))
+plot = plot + facet_wrap(~genotype)
+plot
+```
+
+
+## JAGS model
+### Reformat as JAGS input
+```{r JAGS prep}
+nrT = length(time)
+for (geno in genotype) {
+  ally = c()
+  for (rep in replicate) {
+    ally = c(ally, list(alldata[alldata$genotype == geno & alldata$rep == rep,]$y))
+  }
+  ally = do.call(rbind, ally)
+  if(geno == 1) {
+    res = array(ally, dim = c(nrep, length(time), 1))
+  } else {
+    res = array(c(res, ally), dim = c(nrep, length(time), dim(res)[3] + 1))
+  }
+}
+dim(res) # should be n (rows) x nrT (columns) x ngeno (arrays)
+```
+
+### Setting up JAGS code
+$$
+y_{i,j} \sim MVN \bigg(\frac{d_i}{1 + exp(b_i(T - e_i))}, sd\cdot I\bigg)\\
+sd \sim \text{Unif}(0, 100)\\
+b_i \sim MVN(\mu_b , \sigma_b) \\
+d_i \sim MVN(\mu_d , \sigma_d) \\
+e_i \sim MVN(\mu_e , \sigma_e) \\
+\mu_j \sim N(0, 100) \text{ for j} \in (b, d, e)\\
+\tau_j = \frac{1}{\sigma_j^2} \sim \chi^2(100) \text{ for j} \in (b, d, e)
+$$
+
+```{r JAGS}
+
+jagsData <- list("Y"=res,"N"=ngeno,"nrT"=nrT,"time"=time, "nRep" = nrep)
+
+model_string <- "model {
+  # dimensions of Y matrix = nRep x nrT x N
+  for (i in 1:N) { # loop over genotypes
+    for (t in 1:nrT) { # loop over time points
+      for (j in 1:nRep) { # loop over replicates
+        Y[j, t, i] ~ dnorm((d[i] / (1 + exp(b[i] * (time[t] - e[i])))), 1/pow(sd,2)) 
+      }
+    }
+  }
+  sd ~ dunif(0, 100)
+  
+  for (i in 1:N) { # loop over genotypes
+    b[i] ~ dnorm(mu[1], tau[1])
+    d[i] ~ dnorm(mu[2], tau[2])
+    e[i] ~ dnorm(mu[3], tau[3])
+  }
+  
+  for (j in 1:3) {
+    mu[j] ~ dnorm(0, 0.01)
+    tau[j] ~ dchisq(100)
+    sig[j] <- 1/tau[j]
+  }
+}"
+
+```
+
+### Running JAGS
+```{r run}
+nadapt = 5000
+nupdate = 1000
+nimplement = 10000
+parameters = c("b","d", "e", "sd", "sig", "mu")
+model <- jags.model(textConnection(model_string),
+                    data=jagsData, n.chains=1, n.adapt = nadapt, inits = list(.RNG.name = "base::Wichmann-Hill",.RNG.seed = seed))
+
+update(model, n.iter=nupdate)
+samples <- coda.samples(model, variable.names=parameters, n.iter=nimplement)
+s = as.data.frame(as.matrix(samples))
+head(s[,1:5])
+```
+
+## Plotting estimates
+### Plotting b,d,e estimates
+```{r plot param estimates, echo = FALSE}
+total = dim(s)[1]; thin = rep(total/1000, 3)
+print(paste("thinning to use every", total/1000))
+p = c("b", "d", "e")
+print(ngeno)
+for (i in 1:length(p)) {
+  index = grep(p[i],colnames(s))
+  subset = as.data.frame(s[,index])
+
+  keep = seq(1, total,thin[i])
+  subset = as.data.frame(subset[keep,])
+  # print(dim(subset))
+  subset = as.data.frame(rowMeans(subset))
+
+  print(dim(subset))
+  colnames(subset) = c("mean")
+  subset$iteration = 1:(total/thin[i])
+  subset$param = p[i]
+  if(i == 1) {
+    graphdata = subset
+  }
+  else {
+    graphdata = rbind(graphdata, subset)
+  }
+}
+graphdata$iteration = as.numeric(graphdata$iteration)
+
+ggplot(graphdata) +
+  geom_histogram(aes(mean), bins = 20,fill="lightblue", colour="black") +
+  facet_wrap(~param, scales = "free") +
+  ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+
+ggplot(graphdata) +
+  geom_point(aes(iteration, mean)) +
+  facet_wrap(~param, scales = "free", nrow = 3) +
+  ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+```
+### Plotting variance of b,d,e
+```{r plot var estimates, echo = FALSE}
+total = dim(s)[1]; thin = rep(total/1000, 3)
+print(paste("thinning to use every", total/1000))
+p = c("var(b)", "var(d)", "var(e)")
+for (i in 1:length(p)) {
+  param_index = grep("sig", colnames(s))
+  param = colnames(s)[param_index]
+  index = param_index[grep(paste0(i,"\\]"),param)]
+  subset = as.data.frame(s[,index])
+
+  keep = seq(1, total,thin[i])
+  subset = as.data.frame(subset[keep, ])
+  colnames(subset) = c("var")
+
+  subset$iteration = row.names(subset)
+  subset$param = p[i]
+  if(i == 1) {
+    graphdata = subset
+  }
+  else {
+    graphdata = rbind(graphdata, subset)
+  }
+}
+graphdata$iteration = as.numeric(graphdata$iteration)
+ggplot(graphdata) +
+  geom_histogram(aes(var), bins = 20,fill="lightblue", colour="black") +
+  facet_wrap(~param, scales = "free") +
+  ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+
+ggplot(graphdata) +
+  geom_point(aes(iteration, var)) +
+  facet_wrap(~param, scales = "free", nrow = 3) +
+  ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+
+```
+
+### Plotting sd estimates
+```{r plot sd estimates, echo = FALSE}
+total = dim(s)[1]; thin = total/1000
+print(paste("thinning to use every", total/1000))
+sd = as.data.frame(s$sd)
+keep = seq(1, total,thin)
+sd = as.data.frame(sd[keep, 1])
+colnames(sd) = "sd"
+sd$iteration = row.names(sd)
+sd$iteration = as.numeric(sd$iteration)
+ggplot(sd) +
+  geom_point(aes(iteration, sd)) +
+  ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+ggplot(sd) +
+  geom_histogram(aes(sd), bins = 20,fill="lightblue", colour="black") +
+  ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+```
+### Plotting mu of b,d,e
+```{r plot var estimates, echo = FALSE}
+# total = dim(s)[1]; thin = rep(total/1000, 3)
+# print(paste("thinning to use every", total/1000))
+# p = c("mu(b)", "mu(d)", "mu(e)")
+# for (i in 1:length(p)) {
+#   param_index = grep("mu", colnames(s))
+#   param = colnames(s)[param_index]
+#   index = param_index[grep(paste0(i,"\\]"),param)]
+#   subset = as.data.frame(s[,index])
+# 
+#   keep = seq(1, total,thin[i])
+#   subset = as.data.frame(subset[keep, ])
+#   colnames(subset) = c("mu")
+# 
+#   subset$iteration = row.names(subset)
+#   subset$param = p[i]
+#   if(i == 1) {
+#     graphdata = subset
+#   }
+#   else {
+#     graphdata = rbind(graphdata, subset)
+#   }
+# }
+# graphdata$iteration = as.numeric(graphdata$iteration)
+# ggplot(graphdata) +
+#   geom_histogram(aes(mu), bins = 20,fill="lightblue", colour="black") +
+#   facet_wrap(~param, scales = "free") +
+#   ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+# 
+# ggplot(graphdata) +
+#   geom_point(aes(iteration, mu)) +
+#   facet_wrap(~param, scales = "free", nrow = 3) +
+#   ggtitle(paste("Adapt =", nadapt, "Update =", nupdate, "Run =", nimplement))
+
+```
+
+
